@@ -1,75 +1,159 @@
-import threading
+"""Threaded producer-consumer task processing simulation."""
+
+from __future__ import annotations
+
+import argparse
+import logging
 import queue
 import random
+import threading
 import time
+from dataclasses import dataclass
+from typing import Callable
 
-# Create a queue where tasks will be added and consumed
-task_queue = queue.Queue()
 
-# Set the maximum number of retries allowed for a task if it fails
-MAX_RETRIES = 3
+LOGGER = logging.getLogger("task_simulation")
+TASK_NAMES = ("email", "data_backup", "report_gen", "image_resize", "log_rotation")
 
-# A list of fake tasks to simulate work
-TASKS = ["email", "data_backup", "report_gen", "image_resize", "log_rotation"]
 
-# Define a Task class to represent each unit of work
+@dataclass
 class Task:
-    def __init__(self, name):
-        self.name = name            # Task name (e.g., "email")
-        self.retries = 0            # How many times this task has failed so far
+    """A unit of work and its current retry count."""
 
-    def process(self):
-        """
-        Simulates doing the task with a 50% chance of failure.
-        Returns True if successful, False otherwise.
-        """
-        print(f"Processing task: {self.name} | Attempt: {self.retries + 1}")
-        success = random.choice([True, False])  # Randomly succeed or fail
-        time.sleep(0.5)  # Simulate time taken to process
-        return success
+    name: str
+    retries: int = 0
 
-# The producer keeps creating tasks and adds them to the queue
-def producer():
-    while True:
-        task_name = random.choice(TASKS)   # Pick a random task from the list
-        task = Task(task_name)             # Create a new Task object
-        print(f"[Producer] Created task: {task.name}")
-        task_queue.put(task)               # Add the task to the queue
-        time.sleep(random.uniform(0.5, 1.5))  # Random delay between tasks
 
-# The consumer takes tasks from the queue and tries to process them
-def consumer():
-    while True:
-        task = task_queue.get()  # Get a task from the queue (waits if empty)
+class TaskProcessor:
+    """Coordinate task producers and consumers through a thread-safe queue."""
 
-        if task:
-            success = task.process()  # Try to process the task
+    def __init__(
+        self,
+        workers: int = 3,
+        max_retries: int = 3,
+        failure_rate: float = 0.5,
+        process_delay: float = 0.5,
+        random_source: random.Random | None = None,
+    ) -> None:
+        if workers < 1:
+            raise ValueError("workers must be at least 1")
+        if max_retries < 1:
+            raise ValueError("max_retries must be at least 1")
+        if not 0 <= failure_rate <= 1:
+            raise ValueError("failure_rate must be between 0 and 1")
 
-            if success:
-                print(f"[Consumer] Task '{task.name}' completed ✅\n")
-            else:
-                task.retries += 1  # Increase the retry count
+        self.workers = workers
+        self.max_retries = max_retries
+        self.failure_rate = failure_rate
+        self.process_delay = process_delay
+        self.random = random_source or random.Random()
+        self.tasks: queue.Queue[Task] = queue.Queue()
+        self.stop_event = threading.Event()
+        self._threads: list[threading.Thread] = []
 
-                if task.retries < MAX_RETRIES:
-                    # If the task hasn't reached the retry limit, try again later
-                    print(f"[Consumer] Task '{task.name}' failed ❌ - Retrying ({task.retries})\n")
-                    task_queue.put(task)
-                else:
-                    # Task failed too many times — give up
-                    print(f"[Consumer] Task '{task.name}' permanently failed after {MAX_RETRIES} retries ❌\n")
+    def process_task(self, task: Task) -> bool:
+        """Simulate work and return whether the attempt succeeded."""
+        LOGGER.info(
+            "task_attempt",
+            extra={"task_name": task.name, "attempt": task.retries + 1},
+        )
+        time.sleep(self.process_delay)
+        return self.random.random() >= self.failure_rate
 
-        task_queue.task_done()  # Mark this task as "done" in the queue
+    def handle_task(self, task: Task, processor: Callable[[Task], bool] | None = None) -> str:
+        """Process once and either complete, retry, or permanently fail the task."""
+        succeeded = (processor or self.process_task)(task)
+        if succeeded:
+            LOGGER.info("task_completed", extra={"task_name": task.name})
+            return "completed"
 
-# This part runs when we execute the script directly
+        task.retries += 1
+        if task.retries < self.max_retries:
+            self.tasks.put(task)
+            LOGGER.warning(
+                "task_retry_scheduled",
+                extra={"task_name": task.name, "retry": task.retries},
+            )
+            return "retried"
+
+        LOGGER.error(
+            "task_permanently_failed",
+            extra={"task_name": task.name, "attempts": self.max_retries},
+        )
+        return "failed"
+
+    def producer(self, interval: float = 1.0) -> None:
+        """Generate tasks until shutdown is requested."""
+        while not self.stop_event.is_set():
+            task = Task(self.random.choice(TASK_NAMES))
+            self.tasks.put(task)
+            LOGGER.info("task_created", extra={"task_name": task.name})
+            self.stop_event.wait(interval)
+
+    def consumer(self) -> None:
+        """Consume queued tasks while the simulation is active."""
+        while not self.stop_event.is_set() or not self.tasks.empty():
+            try:
+                task = self.tasks.get(timeout=0.2)
+            except queue.Empty:
+                continue
+            try:
+                self.handle_task(task)
+            finally:
+                self.tasks.task_done()
+
+    def run(self, duration: float = 30.0, production_interval: float = 1.0) -> None:
+        """Start the simulation, run for a fixed duration, then shut down cleanly."""
+        producer = threading.Thread(
+            target=self.producer,
+            args=(production_interval,),
+            name="producer",
+            daemon=True,
+        )
+        consumers = [
+            threading.Thread(target=self.consumer, name=f"worker-{number}", daemon=True)
+            for number in range(1, self.workers + 1)
+        ]
+        self._threads = [producer, *consumers]
+
+        LOGGER.info(
+            "simulation_started",
+            extra={"workers": self.workers, "duration_seconds": duration},
+        )
+        for thread in self._threads:
+            thread.start()
+
+        self.stop_event.wait(duration)
+        self.stop_event.set()
+        producer.join(timeout=2)
+        self.tasks.join()
+        for consumer in consumers:
+            consumer.join(timeout=2)
+        LOGGER.info("simulation_stopped")
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--workers", type=int, default=3)
+    parser.add_argument("--duration", type=float, default=30.0)
+    parser.add_argument("--max-retries", type=int, default=3)
+    parser.add_argument("--failure-rate", type=float, default=0.5)
+    parser.add_argument("--production-interval", type=float, default=1.0)
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(threadName)s %(message)s",
+    )
+    TaskProcessor(
+        workers=args.workers,
+        max_retries=args.max_retries,
+        failure_rate=args.failure_rate,
+    ).run(duration=args.duration, production_interval=args.production_interval)
+
+
 if __name__ == "__main__":
-    # Create one producer thread and one consumer thread
-    producer_thread = threading.Thread(target=producer, daemon=True)
-    consumer_thread = threading.Thread(target=consumer, daemon=True)
-
-    # Start both threads
-    producer_thread.start()
-    consumer_thread.start()
-
-    # Let the simulation run for 30 seconds, then exit
-    time.sleep(30)
-    print("\n[System] Shutting down after 30 seconds.")
+    main()
